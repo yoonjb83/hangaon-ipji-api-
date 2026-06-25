@@ -88,6 +88,28 @@ async def region_from_coord(lat: float, lng: float):
         return None, None
 
 
+async def nearest_subway(lat: float, lng: float):
+    """카카오 카테고리 검색(SW8=지하철역)으로 가장 가까운 역과 거리(m)를 구함."""
+    if not KAKAO_KEY:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                "https://dapi.kakao.com/v2/local/search/category.json",
+                params={"category_group_code": "SW8", "x": lng, "y": lat,
+                        "radius": 20000, "sort": "distance", "size": 1},
+                headers={"Authorization": f"KakaoAK {KAKAO_KEY}"},
+            )
+        r.raise_for_status()
+        docs = r.json().get("documents", [])
+        if not docs:
+            return None
+        d = docs[0]
+        return {"name": d.get("place_name"), "dist_m": int(d.get("distance") or 0)}
+    except Exception:
+        return None
+
+
 class DiagnoseReq(BaseModel):
     address: str | None = None
     lat: float | None = None
@@ -126,6 +148,9 @@ async def diagnose(req: DiagnoseReq):
     auto_radius = AUTO_RADIUS[req.inst]
     acc = accidents_data.analyze_accidents(coord["lat"], coord["lng"], auto_radius)
 
+    # 접근성 (카카오: 최근접 지하철역)
+    transit = await nearest_subway(coord["lat"], coord["lng"])
+
     # 인구분석 (SGIS)
     pop_data = None
     region = {"sido": None, "sigungu": None}
@@ -143,8 +168,8 @@ async def diagnose(req: DiagnoseReq):
         "pop":  scoring.pop_score_from_sgis(pop_data),
         "fit":  scoring.fit_score_from_sgis(req.ptype, pop_data),
         "auto": scoring.auto_score(acc["auto_index"]),
+        "access": scoring.access_score(transit["dist_m"]) if transit else None,
         "flow":   None,
-        "access": None,
     }
     score, used = scoring.total_score(axes, req.inst, req.ptype)
 
@@ -158,6 +183,7 @@ async def diagnose(req: DiagnoseReq):
         "ptype": req.ptype,
         "raw": comp,
         "accident": acc,
+        "transit": transit,
         "population": pop_data,
         "axes": axes,
         "axes_used": used,
