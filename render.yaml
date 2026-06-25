@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: hangaon-ipji-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: KAKAO_REST_API_KEY
+        sync: false
+      - key: SGIS_CONSUMER_KEY
+        sync: false
+      - key: SGIS_CONSUMER_SECRET
+        sync: false
+      - key: SGIS_POP_YEAR
+        value: "2023"
