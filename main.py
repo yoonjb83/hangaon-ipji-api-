@@ -2,6 +2,7 @@
 한가온 입지 진단 API (클라우드 경량판 · DB 없음)
 - 경쟁분석: clinics.json 메모리 로드 (PostGIS 대체)
 - 인구분석: SGIS
+- 자보분석: accidents.json 메모리 로드 (도로교통공단 사고다발지역)
 - 지오코딩: 카카오 (메모리 캐시)
 
 로컬 실행:  uvicorn main:app --reload
@@ -19,6 +20,7 @@ from dotenv import load_dotenv
 import scoring
 import sgis
 import clinics_data
+import accidents_data
 
 load_dotenv()
 
@@ -30,6 +32,9 @@ app.add_middleware(
 )
 
 DEFAULT_RADIUS = {"clinic": 500, "inpatient": 1500, "hospital": 2000}
+
+# 자보 전용 반경 (자보 환자는 더 넓은 곳에서 유입 → 경쟁 반경보다 크게)
+AUTO_RADIUS = {"clinic": 1500, "inpatient": 2500, "hospital": 3000}
 
 # 지오코딩 결과 메모리 캐시 (DB 대체)
 _geo_cache = {}
@@ -117,6 +122,10 @@ async def diagnose(req: DiagnoseReq):
     # 경쟁분석 (clinics.json)
     comp = clinics_data.analyze_competition(coord["lat"], coord["lng"], radius)
 
+    # 자보분석 (accidents.json) — 자보 전용 반경 사용
+    auto_radius = AUTO_RADIUS[req.inst]
+    acc = accidents_data.analyze_accidents(coord["lat"], coord["lng"], auto_radius)
+
     # 인구분석 (SGIS)
     pop_data = None
     region = {"sido": None, "sigungu": None}
@@ -133,8 +142,8 @@ async def diagnose(req: DiagnoseReq):
         "comp": scoring.comp_score(comp["competitors"]),
         "pop":  scoring.pop_score_from_sgis(pop_data),
         "fit":  scoring.fit_score_from_sgis(req.ptype, pop_data),
+        "auto": scoring.auto_score(acc["auto_index"]),
         "flow":   None,
-        "auto":   None,
         "access": None,
     }
     score, used = scoring.total_score(axes, req.inst, req.ptype)
@@ -144,23 +153,27 @@ async def diagnose(req: DiagnoseReq):
         "coord": coord,
         "region": region,
         "radius_m": radius,
+        "auto_radius_m": auto_radius,
         "inst": req.inst,
         "ptype": req.ptype,
         "raw": comp,
+        "accident": acc,
         "population": pop_data,
         "axes": axes,
         "axes_used": used,
         "score": score,
         "grade": scoring.grade(score),
         "data_generated_at": clinics_data.generated_at(),
-        "note": "경량판: 경쟁분석 + 인구분석 실데이터.",
+        "note": "경량판: 경쟁분석 + 인구분석 + 자보분석 실데이터.",
         "generated_at": dt.datetime.now().isoformat(),
     }
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "clinics_loaded": clinics_data.count_loaded(),
+    return {"status": "ok",
+            "clinics_loaded": clinics_data.count_loaded(),
+            "accidents_loaded": accidents_data.count_loaded(),
             "data_generated_at": clinics_data.generated_at()}
 
 

@@ -22,6 +22,11 @@ INST = {
     "hospital":  {"pop": 1.25, "flow": 0.6,  "comp": 0.75, "auto": 1.4,  "access": 1.4,  "fit": 1.0},
 }
 
+# 자보 원지표(auto_index)가 이 값 이상이면 자보수요 만점(100).
+# auto_index = Σ(반경 내 발생건수 × 거리감쇠).
+# 실데이터 분포(전국 한의원 표본, 반경 2.5km)의 상위 약 10%(p90) 기준으로 보정.
+AUTO_INDEX_FULL = 260.0
+
 
 def clamp(v, lo=0.0, hi=100.0):
     return max(lo, min(hi, v))
@@ -56,9 +61,10 @@ def flow_score(floating_index):
     return normalize(floating_index, 0, 100)
 
 
-def auto_score(accident_grade_value):
-    """자보수요: 반경 내 사고다발 가중치 (도로교통공단, P3)."""
-    return normalize(accident_grade_value, 0, 100)
+def auto_score(auto_index):
+    """자보수요: 반경 내 (발생건수 × 거리감쇠) 합산 원지표 → 0~100.
+    도로교통공단 사고다발지역(P3). accidents_data.analyze_accidents()의 auto_index 사용."""
+    return normalize(auto_index, 0, AUTO_INDEX_FULL)
 
 
 def access_score(nearest_station_m):
