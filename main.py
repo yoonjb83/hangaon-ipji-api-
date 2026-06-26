@@ -155,8 +155,8 @@ async def geocode_ep(body: dict):
 
 @app.post("/diagnose")
 async def diagnose(req: DiagnoseReq):
-    if req.inst not in scoring.INST or req.ptype not in scoring.TYPES:
-        raise HTTPException(400, "inst/ptype 값 오류")
+    if req.inst not in scoring.WEIGHTS:
+        raise HTTPException(400, "inst 값 오류")
 
     if req.lat is not None and req.lng is not None:
         coord = {"lat": req.lat, "lng": req.lng}
@@ -198,20 +198,17 @@ async def diagnose(req: DiagnoseReq):
         area = math.pi * (radius / 1000.0) ** 2
         catchment = max(pop_data["tot_ppltn"], pop_data["ppltn_dnsty"] * area)
 
-    # 특화적합: 자보는 자보수요로, 그 외는 연령·부양비로
-    if req.ptype == "auto":
-        fit = scoring.auto_score(acc["auto_index"])
-    else:
-        fit = scoring.fit_score_from_sgis(req.ptype, pop_data)
-
+    # 입지 4축 (종합점수)
     axes = {
         "demand": scoring.demand_score(catchment, req.inst),
         "flow":   scoring.flow_score(market["store_count"]) if market else None,
         "comp":   scoring.comp_score(req.inst, comp.get("clinic_cnt"), comp.get("hospital_cnt")),
         "auto":   scoring.auto_score(acc["auto_index"]),
-        "fit":    fit,
     }
-    score, used = scoring.total_score(axes, req.inst, req.ptype)
+    score, used = scoring.total_score(axes, req.inst)
+
+    # 진료특화 4종 적합도 (참고 그래프용, 종합점수 미반영)
+    fit = scoring.fit_scores(pop_data, acc["auto_index"])
 
     return {
         "address": req.address,
@@ -229,10 +226,11 @@ async def diagnose(req: DiagnoseReq):
         "catchment_pop": round(catchment) if catchment else None,
         "axes": axes,
         "axes_used": used,
+        "fit_scores": fit,
         "score": score,
         "grade": scoring.grade(score),
         "data_generated_at": clinics_data.generated_at(),
-        "note": "v2: 거주수요(행정동)·유동·경쟁·자보·특화 실데이터.",
+        "note": "v3: 입지 4축(거주수요·유동·경쟁·자보) 종합 + 진료특화 4종 적합도.",
         "generated_at": dt.datetime.now().isoformat(),
     }
 

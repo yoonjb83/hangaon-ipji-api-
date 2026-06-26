@@ -1,35 +1,26 @@
 """
-점수 산출 엔진 v2
-- 5축: 거주수요(demand) · 유동인구(flow) · 경쟁우위(comp) · 자보(auto) · 특화적합(fit)
-- 거주수요 = 행정동 기반 반경 거주인구(주축). 역거리 접근성 폐기.
-- 경쟁 = 종별 맞춤(한방병원은 한방병원 수, 한의원은 한의원 수) + 현실 기준 완만 감점.
+점수 산출 엔진 v3
+- 종합점수 = 입지 4축: 거주수요(demand)·유동인구(flow)·경쟁우위(comp)·자보(auto)
+- 진료특화는 '선택'이 아니라 '결과' → 4개 특화 적합도(통증/다이어트/소아/자보)를 항상 계산해 함께 제공(종합점수엔 미반영).
+- 거주수요 = 행정동 기반 반경 거주인구(주축). 경쟁 = 종별 맞춤·현실 기준 완만 감점.
 - 9단계 등급(A+~D).
 """
 
-AXES = ["demand", "flow", "comp", "auto", "fit"]
+AXES = ["demand", "flow", "comp", "auto"]
 
-# 진료 특화별 가중치 (demand, flow, comp, auto, fit)
-TYPES = {
-    "pain":  {"demand": 1.3, "flow": 0.7, "comp": 1.0, "auto": 0.4, "fit": 0.7},
-    "diet":  {"demand": 1.0, "flow": 1.3, "comp": 1.0, "auto": 0.3, "fit": 0.9},
-    "child": {"demand": 1.3, "flow": 0.7, "comp": 1.0, "auto": 0.3, "fit": 1.0},
-    "auto":  {"demand": 1.1, "flow": 0.6, "comp": 1.0, "auto": 1.1, "fit": 0.7},
+# 종합점수 가중치 (종별). 진료특화 가중치는 제거(특화는 별도 적합도로만 제공).
+WEIGHTS = {
+    "clinic":    {"demand": 1.3, "flow": 1.1, "comp": 1.0, "auto": 0.5},
+    "inpatient": {"demand": 1.4, "flow": 0.7, "comp": 1.3, "auto": 0.8},
+    "hospital":  {"demand": 1.6, "flow": 0.6, "comp": 1.3, "auto": 0.4},
 }
 
-# 기관 종별 보정 (한의원 / 입원실 한의원 / 한방병원)
-INST = {
-    "clinic":    {"demand": 1.0, "flow": 1.1, "comp": 1.0, "auto": 0.5, "fit": 1.0},
-    "inpatient": {"demand": 1.2, "flow": 0.8, "comp": 1.2, "auto": 0.7, "fit": 1.0},
-    "hospital":  {"demand": 1.3, "flow": 0.6, "comp": 1.1, "auto": 0.5, "fit": 1.0},
-}
+# 진료특화 4종(적합도 그래프용 라벨)
+SPECIALTIES = ["pain", "diet", "child", "auto"]
 
-# 거주수요 만점/하한 기준(종별 적정 인구). 한방병원 2km≈10만 기준 반영.
 DEMAND_LO = {"clinic": 8000,  "inpatient": 12000, "hospital": 22000}
 DEMAND_HI = {"clinic": 30000, "inpatient": 38000, "hospital": 85000}
-
-# 자보 원지표(auto_index) 만점기준 (v2에서 완화: 260 → 120)
 AUTO_INDEX_FULL = 120.0
-# 유동인구(상가 수) 만점기준
 FLOW_INDEX_FULL = 2200.0
 
 
@@ -48,63 +39,51 @@ def normalize(value, lo, hi, invert=False):
     return clamp(s)
 
 
-# ── 축 서브점수 ─────────────────────────────
+# ── 입지 4축 ─────────────────────────────
 def demand_score(catchment_pop, inst):
-    """거주수요: 내원 가능 반경 내 거주인구(행정동 기반). 종별 적정 인구로 정규화."""
     if catchment_pop is None:
         return None
     return normalize(catchment_pop, DEMAND_LO.get(inst, 8000), DEMAND_HI.get(inst, 60000))
 
 
 def comp_score(inst, clinic_cnt, hospital_cnt):
-    """경쟁우위: 종별 직접 경쟁만, 현실 기준으로 완만하게(바닥 점수 보장)."""
     cc = clinic_cnt or 0
     hc = hospital_cnt or 0
     if inst == "clinic":
-        return clamp(100 - cc * 1.0, 40, 100)     # 한의원 수 기준(완만, 바닥40)
-    return clamp(100 - hc * 10, 55, 100)          # 한방병원 수 기준(10만당 2~3 정상, 바닥55)
+        return clamp(100 - cc * 1.0, 40, 100)
+    return clamp(100 - hc * 10, 55, 100)
 
 
 def flow_score(store_count):
-    """유동인구(상권 활성도): 반경 500m 내 상가 수 → 0~100."""
     return normalize(store_count, 0, FLOW_INDEX_FULL)
 
 
 def auto_score(auto_index):
-    """자보수요: 반경 내 (발생건수 × 거리감쇠) 합산 → 0~100."""
     return normalize(auto_index, 0, AUTO_INDEX_FULL)
 
 
-def fit_score_from_sgis(ptype, s):
-    """진료 특화별 타깃 인구 적합도 (행정동 SGIS 연령·부양비 기반).
-    ※ ptype=='auto'는 main에서 자보수요(auto_index)로 직접 계산한다."""
-    if not s:
-        return None
-    avg_age = s.get("avg_age")
-    old = s.get("oldage_suprt_per")   # 노년부양비
-    juv = s.get("juv_suprt_per")      # 유년부양비
-    if ptype == "pain":
-        return normalize(old, 12, 35)
-    if ptype == "diet":
-        return normalize(avg_age, 36, 48, invert=True)
-    if ptype == "child":
-        return normalize(juv, 12, 28)
-    return None
+# ── 진료특화 4종 적합도 (종합점수 미반영) ─────────────────────────────
+def fit_scores(pop, auto_index):
+    """통증·재활 / 다이어트·미용 / 소아·성장 / 자보 적합도."""
+    out = {"pain": None, "diet": None, "child": None, "auto": auto_score(auto_index)}
+    if pop:
+        out["pain"] = normalize(pop.get("oldage_suprt_per"), 12, 35)   # 고령 ↑
+        out["diet"] = normalize(pop.get("avg_age"), 36, 48, invert=True)  # 젊을수록 ↑
+        out["child"] = normalize(pop.get("juv_suprt_per"), 12, 28)     # 영유아 ↑
+    return out
 
 
 # ── 가중 합산 ─────────────────────────────
-def total_score(axes: dict, inst: str, ptype: str):
-    w_type = TYPES[ptype]
-    w_inst = INST[inst]
+def total_score(axes: dict, inst: str):
+    w = WEIGHTS.get(inst, WEIGHTS["clinic"])
     num = den = 0.0
     used = []
     for a in AXES:
         s = axes.get(a)
         if s is None:
             continue
-        w = w_type[a] * w_inst[a]
-        num += w * s
-        den += w
+        num += w[a] * s
+        den += w[a]
         used.append(a)
     if den == 0:
         return None, used
@@ -112,7 +91,6 @@ def total_score(axes: dict, inst: str, ptype: str):
 
 
 def grade(score):
-    """9단계 등급."""
     if score is None:
         return None
     table = [(88, "A+", "최우수"), (80, "A", "우수"), (73, "A-", "우수"),
