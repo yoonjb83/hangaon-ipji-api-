@@ -2,8 +2,8 @@
 SGIS(통계지리정보서비스) 인구 데이터 연동
 - 토큰 발급(만료 시 자동 갱신)
 - 전국 시군구 이름 → SGIS 코드 매핑 (addr/stage 로 1회 구축 후 캐시)
-- 시군구 단위 인구/고령/유년/가구/종사자 조회
-※ 시군구 단위라 배후인구 절대값은 다소 거칠지만, 고령·유년 '비율' 지표는 그대로 의미가 있다.
+- 시군구/행정동 단위 인구/고령/유년/가구/종사자 조회
+※ v2: 행정동(읍면동) 단위 인구·밀도 지원 (배후 거주인구 정밀화).
 """
 import os
 import re
@@ -16,7 +16,6 @@ load_dotenv()
 
 
 def _clean_key(v: str) -> str:
-    # 영문자·숫자만 남김 (BOM, 공백, 따옴표, 줄바꿈 등 모두 제거)
     return re.sub(r"[^A-Za-z0-9]", "", v or "")
 
 
@@ -28,6 +27,7 @@ POP_YEAR = os.environ.get("SGIS_POP_YEAR", "2023")
 _lock = threading.Lock()
 _token = {"value": None, "exp": 0}
 _sigungu = {}   # {"서울특별시|강남구": "11230", ...}  및  {"강남구": "11230"}
+_dong = {}      # {시군구코드: {읍면동명: 읍면동코드}}
 
 
 def _get_token():
@@ -36,7 +36,6 @@ def _get_token():
             return _token["value"]
         if not KEY or not SECRET:
             raise RuntimeError("SGIS 키 미설정(.env)")
-        print(f"[SGIS] key_len={len(KEY)} secret_len={len(SECRET)}")
         r = httpx.get(f"{BASE}/auth/authentication.json",
                       params={"consumer_key": KEY, "consumer_secret": SECRET},
                       timeout=30, follow_redirects=True)
@@ -45,7 +44,6 @@ def _get_token():
         tok = res.get("accessToken")
         if not tok:
             raise RuntimeError(f"SGIS 토큰 발급 실패: {r.json().get('errMsg')}")
-        # accessTimeout(ms) 활용, 없으면 30분
         try:
             exp = int(res.get("accessTimeout", "0")) / 1000
         except (TypeError, ValueError):
@@ -56,11 +54,9 @@ def _get_token():
 
 
 def _build_sigungu_map():
-    """전국 시도→시군구를 돌며 이름→코드 매핑 구축 (최초 1회)."""
     if _sigungu:
         return
     tok = _get_token()
-    # 시도 목록
     sido = httpx.get(f"{BASE}/addr/stage.json", params={"accessToken": tok},
                      timeout=30, follow_redirects=True).json().get("result", [])
     for s in sido:
@@ -77,16 +73,44 @@ def _build_sigungu_map():
             cd = g.get("cd")
             if nm and cd:
                 _sigungu[f"{sido_nm}|{nm}"] = cd
-                _sigungu.setdefault(nm, cd)   # 이름만으로도 조회 가능(동명 시군구는 시도 우선)
+                _sigungu.setdefault(nm, cd)
         time.sleep(0.02)
 
 
 def resolve_sigungu_code(sido_nm: str, sigungu_nm: str):
-    """카카오가 준 시도·시군구 이름 → SGIS 코드."""
     _build_sigungu_map()
     if sido_nm and sigungu_nm and f"{sido_nm}|{sigungu_nm}" in _sigungu:
         return _sigungu[f"{sido_nm}|{sigungu_nm}"]
     return _sigungu.get(sigungu_nm)
+
+
+def _dong_map(sgg_code: str):
+    """시군구 코드 → {읍면동명: 읍면동코드} (캐시)."""
+    if sgg_code in _dong:
+        return _dong[sgg_code]
+    tok = _get_token()
+    try:
+        res = httpx.get(f"{BASE}/addr/stage.json",
+                        params={"accessToken": tok, "cd": sgg_code},
+                        timeout=30, follow_redirects=True).json().get("result", [])
+    except Exception:
+        res = []
+    m = {g["addr_name"]: g["cd"] for g in res if g.get("addr_name") and g.get("cd")}
+    _dong[sgg_code] = m
+    return m
+
+
+def resolve_dong_code(sgg_code: str, dong_nm: str):
+    if not (sgg_code and dong_nm):
+        return None
+    dm = _dong_map(sgg_code)
+    if dong_nm in dm:
+        return dm[dong_nm]
+    key = dong_nm.replace(" ", "")
+    for nm, cd in dm.items():
+        if nm.replace(" ", "") == key:
+            return cd
+    return None
 
 
 def get_population_by_code(adm_cd: str, year: str = None):
@@ -109,22 +133,38 @@ def get_population_by_code(adm_cd: str, year: str = None):
 
     return {
         "adm_nm": row.get("adm_nm"),
-        "tot_ppltn": num(row.get("tot_ppltn")),       # 총인구
-        "tot_family": num(row.get("tot_family")),      # 총가구
-        "employee_cnt": num(row.get("employee_cnt")),  # 종사자(직장인구)
-        "avg_age": num(row.get("avg_age")),            # 평균연령
-        "oldage_suprt_per": num(row.get("oldage_suprt_per")),  # 노년부양비
-        "juv_suprt_per": num(row.get("juv_suprt_per")),        # 유년부양비
-        "ppltn_dnsty": num(row.get("ppltn_dnsty")),    # 인구밀도
+        "tot_ppltn": num(row.get("tot_ppltn")),
+        "tot_family": num(row.get("tot_family")),
+        "employee_cnt": num(row.get("employee_cnt")),
+        "avg_age": num(row.get("avg_age")),
+        "oldage_suprt_per": num(row.get("oldage_suprt_per")),
+        "juv_suprt_per": num(row.get("juv_suprt_per")),
+        "ppltn_dnsty": num(row.get("ppltn_dnsty")),
     }
 
 
 def get_population_for_region(sido_nm: str, sigungu_nm: str):
-    """카카오 지역명으로 인구 데이터를 한 번에 가져오기."""
+    """시군구 단위 (폴백용)."""
     code = resolve_sigungu_code(sido_nm, sigungu_nm)
     if not code:
         return None
     pop = get_population_by_code(code)
     if pop:
         pop["adm_cd"] = code
+        pop["level"] = "sigungu"
+    return pop
+
+
+def get_population_for_dong(sido_nm: str, sigungu_nm: str, dong_nm: str):
+    """행정동 단위 인구. 행정동 매칭 실패 시 시군구로 폴백."""
+    sgg_code = resolve_sigungu_code(sido_nm, sigungu_nm)
+    if not sgg_code:
+        return None
+    dcode = resolve_dong_code(sgg_code, dong_nm)
+    code = dcode or sgg_code
+    pop = get_population_by_code(code)
+    if pop:
+        pop["adm_cd"] = code
+        pop["level"] = "dong" if dcode else "sigungu"
+        pop["dong_nm"] = dong_nm if dcode else None
     return pop

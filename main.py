@@ -9,6 +9,7 @@
 클라우드:   uvicorn main:app --host 0.0.0.0 --port $PORT
 """
 import os
+import math
 import datetime as dt
 
 import httpx
@@ -32,7 +33,7 @@ app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
 
-DEFAULT_RADIUS = {"clinic": 500, "inpatient": 1500, "hospital": 2000}
+DEFAULT_RADIUS = {"clinic": 800, "inpatient": 1200, "hospital": 2000}
 
 # 자보 전용 반경 (자보 환자는 더 넓은 곳에서 유입 → 경쟁 반경보다 크게)
 AUTO_RADIUS = {"clinic": 1500, "inpatient": 2500, "hospital": 3000}
@@ -74,7 +75,7 @@ async def geocode(address: str):
 
 async def region_from_coord(lat: float, lng: float):
     if not KAKAO_KEY:
-        return None, None
+        return None, None, None
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(
@@ -86,10 +87,11 @@ async def region_from_coord(lat: float, lng: float):
         docs = r.json().get("documents", [])
         doc = next((d for d in docs if d.get("region_type") == "H"), docs[0] if docs else None)
         if not doc:
-            return None, None
-        return doc.get("region_1depth_name"), doc.get("region_2depth_name")
+            return None, None, None
+        return (doc.get("region_1depth_name"), doc.get("region_2depth_name"),
+                doc.get("region_3depth_name"))
     except Exception:
-        return None, None
+        return None, None, None
 
 
 async def nearest_subway(lat: float, lng: float):
@@ -178,25 +180,36 @@ async def diagnose(req: DiagnoseReq):
     # 유동인구 (소상공인: 반경 내 상가 수)
     market = await market_density(coord["lat"], coord["lng"], FLOW_RADIUS)
 
-    # 인구분석 (SGIS)
+    # 인구분석 (SGIS · 행정동 단위)
     pop_data = None
-    region = {"sido": None, "sigungu": None}
+    region = {"sido": None, "sigungu": None, "dong": None}
     try:
-        sido, sigungu = await region_from_coord(coord["lat"], coord["lng"])
-        region = {"sido": sido, "sigungu": sigungu}
+        sido, sigungu, dong = await region_from_coord(coord["lat"], coord["lng"])
+        region = {"sido": sido, "sigungu": sigungu, "dong": dong}
         if sigungu:
-            pop_data = sgis.get_population_for_region(sido, sigungu)
+            pop_data = sgis.get_population_for_dong(sido, sigungu, dong)
     except Exception as e:
         print(f"[SGIS] 실패: {e}")
         pop_data = None
 
+    # 반경 내 거주인구 = max(행정동 인구, 밀도 × 반경면적) — 도심·시골 모두 보정
+    catchment = None
+    if pop_data and pop_data.get("ppltn_dnsty") and pop_data.get("tot_ppltn"):
+        area = math.pi * (radius / 1000.0) ** 2
+        catchment = max(pop_data["tot_ppltn"], pop_data["ppltn_dnsty"] * area)
+
+    # 특화적합: 자보는 자보수요로, 그 외는 연령·부양비로
+    if req.ptype == "auto":
+        fit = scoring.auto_score(acc["auto_index"])
+    else:
+        fit = scoring.fit_score_from_sgis(req.ptype, pop_data)
+
     axes = {
-        "comp": scoring.comp_score(comp["competitors"]),
-        "pop":  scoring.pop_score_from_sgis(pop_data),
-        "fit":  scoring.fit_score_from_sgis(req.ptype, pop_data),
-        "auto": scoring.auto_score(acc["auto_index"]),
-        "access": scoring.access_score(transit["dist_m"]) if transit else None,
-        "flow": scoring.flow_score(market["store_count"]) if market else None,
+        "demand": scoring.demand_score(catchment, req.inst),
+        "flow":   scoring.flow_score(market["store_count"]) if market else None,
+        "comp":   scoring.comp_score(req.inst, comp.get("clinic_cnt"), comp.get("hospital_cnt")),
+        "auto":   scoring.auto_score(acc["auto_index"]),
+        "fit":    fit,
     }
     score, used = scoring.total_score(axes, req.inst, req.ptype)
 
@@ -213,12 +226,13 @@ async def diagnose(req: DiagnoseReq):
         "transit": transit,
         "market": market,
         "population": pop_data,
+        "catchment_pop": round(catchment) if catchment else None,
         "axes": axes,
         "axes_used": used,
         "score": score,
         "grade": scoring.grade(score),
         "data_generated_at": clinics_data.generated_at(),
-        "note": "경량판: 경쟁분석 + 인구분석 + 자보분석 실데이터.",
+        "note": "v2: 거주수요(행정동)·유동·경쟁·자보·특화 실데이터.",
         "generated_at": dt.datetime.now().isoformat(),
     }
 

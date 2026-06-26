@@ -1,34 +1,35 @@
 """
-점수 산출 엔진
-- 프론트(index.html)의 TYPES(진료특화 가중치) / INST(종별 보정)를 그대로 이관해
-  프론트·백엔드 점수 로직을 일치시킨다.
-- 일부 축이 아직 실데이터가 없으면(None), 해당 축을 제외하고 가중 재정규화한다.
+점수 산출 엔진 v2
+- 5축: 거주수요(demand) · 유동인구(flow) · 경쟁우위(comp) · 자보(auto) · 특화적합(fit)
+- 거주수요 = 행정동 기반 반경 거주인구(주축). 역거리 접근성 폐기.
+- 경쟁 = 종별 맞춤(한방병원은 한방병원 수, 한의원은 한의원 수) + 현실 기준 완만 감점.
+- 9단계 등급(A+~D).
 """
 
-AXES = ["pop", "flow", "comp", "auto", "access", "fit"]
+AXES = ["demand", "flow", "comp", "auto", "fit"]
 
-# 진료 특화별 가중치 (pop, flow, comp, auto, access, fit)
+# 진료 특화별 가중치 (demand, flow, comp, auto, fit)
 TYPES = {
-    "pain":  {"pop": 1.0, "flow": 0.6, "comp": 0.8, "auto": 1.0, "access": 0.9, "fit": 1.3},
-    "diet":  {"pop": 0.6, "flow": 1.3, "comp": 0.7, "auto": 0.3, "access": 1.0, "fit": 1.3},
-    "child": {"pop": 1.3, "flow": 0.6, "comp": 1.0, "auto": 0.3, "access": 0.8, "fit": 1.3},
-    "auto":  {"pop": 0.8, "flow": 0.5, "comp": 0.6, "auto": 1.4, "access": 1.1, "fit": 1.0},
+    "pain":  {"demand": 1.3, "flow": 0.7, "comp": 1.0, "auto": 0.4, "fit": 0.7},
+    "diet":  {"demand": 1.0, "flow": 1.3, "comp": 1.0, "auto": 0.3, "fit": 0.9},
+    "child": {"demand": 1.3, "flow": 0.7, "comp": 1.0, "auto": 0.3, "fit": 1.0},
+    "auto":  {"demand": 1.1, "flow": 0.6, "comp": 1.0, "auto": 1.1, "fit": 0.7},
 }
 
 # 기관 종별 보정 (한의원 / 입원실 한의원 / 한방병원)
 INST = {
-    "clinic":    {"pop": 1.0,  "flow": 1.2,  "comp": 1.2,  "auto": 0.9,  "access": 1.0,  "fit": 1.0},
-    "inpatient": {"pop": 1.05, "flow": 0.85, "comp": 1.05, "auto": 1.45, "access": 1.2,  "fit": 1.0},
-    "hospital":  {"pop": 1.25, "flow": 0.6,  "comp": 0.75, "auto": 1.4,  "access": 1.4,  "fit": 1.0},
+    "clinic":    {"demand": 1.0, "flow": 1.1, "comp": 1.0, "auto": 0.5, "fit": 1.0},
+    "inpatient": {"demand": 1.2, "flow": 0.8, "comp": 1.2, "auto": 0.7, "fit": 1.0},
+    "hospital":  {"demand": 1.3, "flow": 0.6, "comp": 1.1, "auto": 0.5, "fit": 1.0},
 }
 
-# 자보 원지표(auto_index)가 이 값 이상이면 자보수요 만점(100).
-# auto_index = Σ(반경 내 발생건수 × 거리감쇠).
-# 실데이터 분포(전국 한의원 표본, 반경 2.5km)의 상위 약 10%(p90) 기준으로 보정.
-AUTO_INDEX_FULL = 260.0
+# 거주수요 만점/하한 기준(종별 적정 인구). 한방병원 2km≈10만 기준 반영.
+DEMAND_LO = {"clinic": 8000,  "inpatient": 12000, "hospital": 22000}
+DEMAND_HI = {"clinic": 30000, "inpatient": 38000, "hospital": 85000}
 
-# 유동인구(상권 활성도): 반경 500m 내 상가 수가 이 값 이상이면 만점(100).
-# 실데이터 분포(전국 한의원 표본)의 상위 약 10%(p90) 기준.
+# 자보 원지표(auto_index) 만점기준 (v2에서 완화: 260 → 120)
+AUTO_INDEX_FULL = 120.0
+# 유동인구(상가 수) 만점기준
 FLOW_INDEX_FULL = 2200.0
 
 
@@ -37,8 +38,6 @@ def clamp(v, lo=0.0, hi=100.0):
 
 
 def normalize(value, lo, hi, invert=False):
-    """min-max 정규화 → 0~100. invert=True면 작을수록 높은 점수.
-    ※ 운영 단계에선 전국 분포의 percentile 테이블로 교체 권장."""
     if value is None:
         return None
     if hi == lo:
@@ -49,68 +48,52 @@ def normalize(value, lo, hi, invert=False):
     return clamp(s)
 
 
-# ── 원본지표 → 축 서브점수 ─────────────────────────────
-def comp_score(competitor_count: int) -> float:
-    """경쟁우위: 반경 내 동종 수가 적을수록 높음 (기준 0~20곳)."""
-    return normalize(competitor_count, 0, 20, invert=True)
+# ── 축 서브점수 ─────────────────────────────
+def demand_score(catchment_pop, inst):
+    """거주수요: 내원 가능 반경 내 거주인구(행정동 기반). 종별 적정 인구로 정규화."""
+    if catchment_pop is None:
+        return None
+    return normalize(catchment_pop, DEMAND_LO.get(inst, 8000), DEMAND_HI.get(inst, 60000))
 
 
-def pop_score(backing_pop):
-    """배후인구: 반경 내 인구 (기준 5천~6만). SGIS 연동(P2) 후 값 주입."""
-    return normalize(backing_pop, 5000, 60000)
+def comp_score(inst, clinic_cnt, hospital_cnt):
+    """경쟁우위: 종별 직접 경쟁만, 현실 기준으로 완만하게(바닥 점수 보장)."""
+    cc = clinic_cnt or 0
+    hc = hospital_cnt or 0
+    if inst == "clinic":
+        return clamp(100 - cc * 1.0, 40, 100)     # 한의원 수 기준(완만, 바닥40)
+    return clamp(100 - hc * 10, 55, 100)          # 한방병원 수 기준(10만당 2~3 정상, 바닥55)
 
 
 def flow_score(store_count):
-    """유동인구(상권 활성도): 반경 500m 내 상가 수 → 0~100 (소상공인 상가정보, P2).
-    상위 약 10%(p90=2,200) 수준에서 만점."""
+    """유동인구(상권 활성도): 반경 500m 내 상가 수 → 0~100."""
     return normalize(store_count, 0, FLOW_INDEX_FULL)
 
 
 def auto_score(auto_index):
-    """자보수요: 반경 내 (발생건수 × 거리감쇠) 합산 원지표 → 0~100.
-    도로교통공단 사고다발지역(P3). accidents_data.analyze_accidents()의 auto_index 사용."""
+    """자보수요: 반경 내 (발생건수 × 거리감쇠) 합산 → 0~100."""
     return normalize(auto_index, 0, AUTO_INDEX_FULL)
 
 
-def access_score(nearest_station_m):
-    """접근성: 최근접 역 거리 (0m=만점, 1200m=0점)."""
-    return normalize(nearest_station_m, 0, 1200, invert=True)
-
-
-def fit_score(value):
-    """특화적합: 타깃 인구 매칭 0~100 (P2에서 종별·특화별 산출)."""
-    return normalize(value, 0, 100)
-
-
-# ── SGIS 인구 데이터 기반 (P2) ─────────────────────────────
-def pop_score_from_sgis(s):
-    """배후인구: 시군구 총인구 (기준 8만~60만)."""
-    if not s:
-        return None
-    return normalize(s.get("tot_ppltn"), 80000, 600000)
-
-
 def fit_score_from_sgis(ptype, s):
-    """진료 특화별 타깃 인구 적합도 (SGIS 연령·부양비 기반)."""
+    """진료 특화별 타깃 인구 적합도 (행정동 SGIS 연령·부양비 기반).
+    ※ ptype=='auto'는 main에서 자보수요(auto_index)로 직접 계산한다."""
     if not s:
         return None
     avg_age = s.get("avg_age")
-    old = s.get("oldage_suprt_per")   # 노년부양비 ↑ = 고령 많음
-    juv = s.get("juv_suprt_per")      # 유년부양비 ↑ = 아이 많음
-    if ptype == "pain":      # 통증·추나: 고령 많을수록 ↑
+    old = s.get("oldage_suprt_per")   # 노년부양비
+    juv = s.get("juv_suprt_per")      # 유년부양비
+    if ptype == "pain":
         return normalize(old, 12, 35)
-    if ptype == "diet":      # 다이어트·미용: 젊은 동네일수록 ↑
+    if ptype == "diet":
         return normalize(avg_age, 36, 48, invert=True)
-    if ptype == "child":     # 소아·성장: 아이 많을수록 ↑
+    if ptype == "child":
         return normalize(juv, 12, 28)
-    if ptype == "auto":      # 자보: 인구 규모 비례(사고 잠재)
-        return normalize(s.get("tot_ppltn"), 100000, 600000)
     return None
 
 
 # ── 가중 합산 ─────────────────────────────
 def total_score(axes: dict, inst: str, ptype: str):
-    """있는 축만으로 가중 합산(없는 축 제외 후 재정규화)."""
     w_type = TYPES[ptype]
     w_inst = INST[inst]
     num = den = 0.0
@@ -129,10 +112,13 @@ def total_score(axes: dict, inst: str, ptype: str):
 
 
 def grade(score):
+    """9단계 등급."""
     if score is None:
         return None
-    if score >= 80:
-        return {"g": "A", "txt": "추천"}
-    if score >= 66:
-        return {"g": "B", "txt": "양호"}
-    return {"g": "C", "txt": "주의"}
+    table = [(88, "A+", "최우수"), (80, "A", "우수"), (73, "A-", "우수"),
+             (66, "B+", "양호"), (60, "B", "양호"), (54, "B-", "양호"),
+             (47, "C+", "주의"), (40, "C", "주의")]
+    for th, g, txt in table:
+        if score >= th:
+            return {"g": g, "txt": txt}
+    return {"g": "D", "txt": "미흡"}
