@@ -25,6 +25,7 @@ import accidents_data
 load_dotenv()
 
 KAKAO_KEY = os.environ.get("KAKAO_REST_API_KEY", "")
+DATA_GO_KR_KEY = os.environ.get("DATA_GO_KR_SERVICE_KEY", "")
 
 app = FastAPI(title="한가온 입지 진단 API (cloud)")
 app.add_middleware(
@@ -35,6 +36,9 @@ DEFAULT_RADIUS = {"clinic": 500, "inpatient": 1500, "hospital": 2000}
 
 # 자보 전용 반경 (자보 환자는 더 넓은 곳에서 유입 → 경쟁 반경보다 크게)
 AUTO_RADIUS = {"clinic": 1500, "inpatient": 2500, "hospital": 3000}
+
+# 유동인구(상권 활성도) 반경 — 즉시 상권 기준 고정 500m
+FLOW_RADIUS = 500
 
 # 지오코딩 결과 메모리 캐시 (DB 대체)
 _geo_cache = {}
@@ -110,6 +114,26 @@ async def nearest_subway(lat: float, lng: float):
         return None
 
 
+async def market_density(lat: float, lng: float, radius: int = 500):
+    """소상공인 상가정보 API로 반경 내 상가 수(상권 활성도)를 구함."""
+    if not DATA_GO_KR_KEY:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=12) as client:
+            r = await client.get(
+                "http://apis.data.go.kr/B553077/api/open/sdsc2/storeListInRadius",
+                params={"serviceKey": DATA_GO_KR_KEY, "cx": lng, "cy": lat,
+                        "radius": radius, "type": "json", "numOfRows": "1", "pageNo": "1"},
+            )
+        r.raise_for_status()
+        tc = r.json().get("body", {}).get("totalCount")
+        if tc is None:
+            return None
+        return {"store_count": int(tc), "radius_m": radius}
+    except Exception:
+        return None
+
+
 class DiagnoseReq(BaseModel):
     address: str | None = None
     lat: float | None = None
@@ -151,6 +175,9 @@ async def diagnose(req: DiagnoseReq):
     # 접근성 (카카오: 최근접 지하철역)
     transit = await nearest_subway(coord["lat"], coord["lng"])
 
+    # 유동인구 (소상공인: 반경 내 상가 수)
+    market = await market_density(coord["lat"], coord["lng"], FLOW_RADIUS)
+
     # 인구분석 (SGIS)
     pop_data = None
     region = {"sido": None, "sigungu": None}
@@ -169,7 +196,7 @@ async def diagnose(req: DiagnoseReq):
         "fit":  scoring.fit_score_from_sgis(req.ptype, pop_data),
         "auto": scoring.auto_score(acc["auto_index"]),
         "access": scoring.access_score(transit["dist_m"]) if transit else None,
-        "flow":   None,
+        "flow": scoring.flow_score(market["store_count"]) if market else None,
     }
     score, used = scoring.total_score(axes, req.inst, req.ptype)
 
@@ -184,6 +211,7 @@ async def diagnose(req: DiagnoseReq):
         "raw": comp,
         "accident": acc,
         "transit": transit,
+        "market": market,
         "population": pop_data,
         "axes": axes,
         "axes_used": used,

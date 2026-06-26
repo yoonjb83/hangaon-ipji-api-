@@ -27,6 +27,10 @@ INST = {
 # 실데이터 분포(전국 한의원 표본, 반경 2.5km)의 상위 약 10%(p90) 기준으로 보정.
 AUTO_INDEX_FULL = 260.0
 
+# 유동인구(상권 활성도): 반경 500m 내 상가 수가 이 값 이상이면 만점(100).
+# 실데이터 분포(전국 한의원 표본)의 상위 약 10%(p90) 기준.
+FLOW_INDEX_FULL = 2200.0
+
 
 def clamp(v, lo=0.0, hi=100.0):
     return max(lo, min(hi, v))
@@ -56,9 +60,10 @@ def pop_score(backing_pop):
     return normalize(backing_pop, 5000, 60000)
 
 
-def flow_score(floating_index):
-    """유동인구: 상권 활성도 지수 0~100 (소상공인, P2)."""
-    return normalize(floating_index, 0, 100)
+def flow_score(store_count):
+    """유동인구(상권 활성도): 반경 500m 내 상가 수 → 0~100 (소상공인 상가정보, P2).
+    상위 약 10%(p90=2,200) 수준에서 만점."""
+    return normalize(store_count, 0, FLOW_INDEX_FULL)
 
 
 def auto_score(auto_index):
