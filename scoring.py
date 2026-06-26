@@ -18,10 +18,16 @@ WEIGHTS = {
 # 진료특화 4종(적합도 그래프용 라벨)
 SPECIALTIES = ["pain", "diet", "child", "auto"]
 
+import math
+
 DEMAND_LO = {"clinic": 8000,  "inpatient": 12000, "hospital": 22000}
 DEMAND_HI = {"clinic": 30000, "inpatient": 38000, "hospital": 85000}
-AUTO_INDEX_FULL = 120.0
+# 유동인구(상가 수) 만점기준
 FLOW_INDEX_FULL = 2200.0
+# 자보: 시군구 연간 교통사고 발생건수 로그곡선 (바닥 35점 보장)
+AUTO_FLOOR = 35.0
+AUTO_LOG_A = -70.0
+AUTO_LOG_B = 47.0
 
 
 def clamp(v, lo=0.0, hi=100.0):
@@ -58,14 +64,17 @@ def flow_score(store_count):
     return normalize(store_count, 0, FLOW_INDEX_FULL)
 
 
-def auto_score(auto_index):
-    return normalize(auto_index, 0, AUTO_INDEX_FULL)
+def auto_score(annual_acc):
+    """자보 점수 = 시군구 연간 교통사고 발생건수(로그 보정). 0/None이면 바닥점 35."""
+    if not annual_acc or annual_acc <= 0:
+        return AUTO_FLOOR
+    return clamp(AUTO_LOG_A + AUTO_LOG_B * math.log10(annual_acc), AUTO_FLOOR, 100)
 
 
 # ── 진료특화 4종 적합도 (종합점수 미반영) ─────────────────────────────
-def fit_scores(pop, auto_index):
+def fit_scores(pop, annual_acc):
     """통증·재활 / 다이어트·미용 / 소아·성장 / 자보 적합도."""
-    out = {"pain": None, "diet": None, "child": None, "auto": auto_score(auto_index)}
+    out = {"pain": None, "diet": None, "child": None, "auto": auto_score(annual_acc)}
     if pop:
         out["pain"] = normalize(pop.get("oldage_suprt_per"), 12, 35)   # 고령 ↑
         out["diet"] = normalize(pop.get("avg_age"), 36, 48, invert=True)  # 젊을수록 ↑

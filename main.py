@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 import scoring
 import sgis
 import clinics_data
-import accidents_data
+import traffic
 
 load_dotenv()
 
@@ -34,9 +34,6 @@ app.add_middleware(
 )
 
 DEFAULT_RADIUS = {"clinic": 800, "inpatient": 1200, "hospital": 2000}
-
-# 자보 전용 반경 (자보 환자는 더 넓은 곳에서 유입 → 경쟁 반경보다 크게)
-AUTO_RADIUS = {"clinic": 1500, "inpatient": 2500, "hospital": 3000}
 
 # 유동인구(상권 활성도) 반경 — 즉시 상권 기준 고정 500m
 FLOW_RADIUS = 500
@@ -170,10 +167,6 @@ async def diagnose(req: DiagnoseReq):
     # 경쟁분석 (clinics.json)
     comp = clinics_data.analyze_competition(coord["lat"], coord["lng"], radius)
 
-    # 자보분석 (accidents.json) — 자보 전용 반경 사용
-    auto_radius = AUTO_RADIUS[req.inst]
-    acc = accidents_data.analyze_accidents(coord["lat"], coord["lng"], auto_radius)
-
     # 접근성 (카카오: 최근접 지하철역)
     transit = await nearest_subway(coord["lat"], coord["lng"])
 
@@ -198,28 +191,36 @@ async def diagnose(req: DiagnoseReq):
         area = math.pi * (radius / 1000.0) ** 2
         catchment = max(pop_data["tot_ppltn"], pop_data["ppltn_dnsty"] * area)
 
+    # 자보분석: 시군구 연간 교통사고 발생건수 (자보 환자 풀)
+    annual_acc = traffic.annual_accidents(region.get("sido"), region.get("sigungu"))
+    acc_region = " ".join(x for x in [region.get("sido"), region.get("sigungu")] if x)
+
     # 입지 4축 (종합점수)
     axes = {
         "demand": scoring.demand_score(catchment, req.inst),
         "flow":   scoring.flow_score(market["store_count"]) if market else None,
         "comp":   scoring.comp_score(req.inst, comp.get("clinic_cnt"), comp.get("hospital_cnt")),
-        "auto":   scoring.auto_score(acc["auto_index"]),
+        "auto":   scoring.auto_score(annual_acc),
     }
     score, used = scoring.total_score(axes, req.inst)
 
     # 진료특화 4종 적합도 (참고 그래프용, 종합점수 미반영)
-    fit = scoring.fit_scores(pop_data, acc["auto_index"])
+    fit = scoring.fit_scores(pop_data, annual_acc)
 
     return {
         "address": req.address,
         "coord": coord,
         "region": region,
         "radius_m": radius,
-        "auto_radius_m": auto_radius,
         "inst": req.inst,
         "ptype": req.ptype,
         "raw": comp,
-        "accident": acc,
+        "accident": {
+            "region": acc_region,
+            "annual_acc": annual_acc,
+            "year": traffic.YEAR,
+            "source": traffic.SOURCE,
+        },
         "transit": transit,
         "market": market,
         "population": pop_data,
@@ -230,7 +231,7 @@ async def diagnose(req: DiagnoseReq):
         "score": score,
         "grade": scoring.grade(score),
         "data_generated_at": clinics_data.generated_at(),
-        "note": "v3: 입지 4축(거주수요·유동·경쟁·자보) 종합 + 진료특화 4종 적합도.",
+        "note": "v3.1: 자보=시군구 연간 교통사고 발생건수 기반.",
         "generated_at": dt.datetime.now().isoformat(),
     }
 
@@ -239,7 +240,7 @@ async def diagnose(req: DiagnoseReq):
 def health():
     return {"status": "ok",
             "clinics_loaded": clinics_data.count_loaded(),
-            "accidents_loaded": accidents_data.count_loaded(),
+            "sgg_traffic_loaded": len(traffic.DATA),
             "data_generated_at": clinics_data.generated_at()}
 
 
