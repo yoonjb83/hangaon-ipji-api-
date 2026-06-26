@@ -72,13 +72,20 @@ def auto_score(annual_acc):
 
 
 # ── 진료특화 4종 적합도 (종합점수 미반영) ─────────────────────────────
-def fit_scores(pop, annual_acc):
-    """통증·재활 / 다이어트·미용 / 소아·성장 / 자보 적합도."""
+def fit_scores(pop, annual_acc, female_ratio=None):
+    """통증·재활 / 다이어트·미용 / 소아·성장 / 자보 적합도.
+    다이어트 = 20~50대 젊은층(평균연령) + 여성비율 결합."""
     out = {"pain": None, "diet": None, "child": None, "auto": auto_score(annual_acc)}
     if pop:
         out["pain"] = normalize(pop.get("oldage_suprt_per"), 12, 35)   # 고령 ↑
-        out["diet"] = normalize(pop.get("avg_age"), 36, 48, invert=True)  # 젊을수록 ↑
         out["child"] = normalize(pop.get("juv_suprt_per"), 12, 28)     # 영유아 ↑
+        young = normalize(pop.get("avg_age"), 36, 48, invert=True)     # 젊을수록 ↑(20~50대 대리)
+        if young is not None:
+            if female_ratio is not None:
+                female = normalize(female_ratio, 46, 53)               # 여성비율 46~53% → 0~100
+                out["diet"] = round(0.7 * young + 0.3 * female)        # 젊음 70% + 여성 30%
+            else:
+                out["diet"] = round(young)
     return out
 
 

@@ -168,3 +168,24 @@ def get_population_for_dong(sido_nm: str, sigungu_nm: str, dong_nm: str):
         pop["level"] = "dong" if dcode else "sigungu"
         pop["dong_nm"] = dong_nm if dcode else None
     return pop
+
+
+# ── 성별 인구비율 (startupbiz/mfratiosummary) ──
+def get_female_ratio(adm_cd, sigungu_cd=None):
+    """행정동(또는 시군구) 여성 인구비율(%) 반환. 실패 시 None.
+    행정동 단위가 안 되면 시군구 코드로 폴백."""
+    tok = _get_token()
+    for cd in [c for c in (adm_cd, sigungu_cd) if c]:
+        try:
+            r = httpx.get(f"{BASE}/startupbiz/mfratiosummary.json",
+                          params={"accessToken": tok, "adm_cd": cd},
+                          timeout=20, follow_redirects=True)
+            j = r.json()
+            if j.get("errCd") == 0 and j.get("result"):
+                row = j["result"][0]
+                f = row.get("f_per")
+                if f not in (None, "", "N/A"):
+                    return float(f)
+        except Exception as e:
+            print(f"[SGIS mfratio] {cd} 실패: {e}")
+    return None

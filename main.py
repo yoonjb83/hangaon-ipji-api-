@@ -205,7 +205,14 @@ async def diagnose(req: DiagnoseReq):
     score, used = scoring.total_score(axes, req.inst)
 
     # 진료특화 4종 적합도 (참고 그래프용, 종합점수 미반영)
-    fit = scoring.fit_scores(pop_data, annual_acc)
+    female_ratio = None
+    try:
+        if pop_data and pop_data.get("adm_cd"):
+            sgg_cd = sgis.resolve_sigungu_code(region.get("sido"), region.get("sigungu"))
+            female_ratio = sgis.get_female_ratio(pop_data.get("adm_cd"), sgg_cd)
+    except Exception as e:
+        print(f"[female_ratio] 실패: {e}")
+    fit = scoring.fit_scores(pop_data, annual_acc, female_ratio)
 
     return {
         "address": req.address,
@@ -224,6 +231,7 @@ async def diagnose(req: DiagnoseReq):
         "transit": transit,
         "market": market,
         "population": pop_data,
+        "female_ratio": female_ratio,
         "catchment_pop": round(catchment) if catchment else None,
         "axes": axes,
         "axes_used": used,
